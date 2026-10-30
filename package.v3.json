@@ -1,0 +1,13 @@
+{
+  "CollectionCoverSync": {
+    "name": "合集封面同步",
+    "description": "定期检查 Emby 合集封面，从 TMDB 补齐缺图、修复损坏图片，保留并备份手工封面。",
+    "labels": "Emby,TMDB,合集,封面",
+    "version": "1.0.0",
+    "icon": "Emby_A.png",
+    "author": "Windz",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {"v1.0.0": "首次发布：周期检查、手动运行、只检查模式、有效图片保护、损坏修复及原图恢复。"}
+  }
+}
