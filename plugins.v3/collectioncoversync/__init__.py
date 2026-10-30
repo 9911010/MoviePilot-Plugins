@@ -17,7 +17,7 @@ class CollectionCoverSync(_PluginBase):
     plugin_name = '合集封面同步'
     plugin_desc = '定期检查 Emby 合集封面，从 TMDB 补齐缺图，修复无效图片并保留手工封面。'
     plugin_icon = 'Emby_A.png'
-    plugin_version = '1.0.0'
+    plugin_version = '1.0.1'
     plugin_author = 'Windz'
     author_url = ''
     plugin_config_prefix = 'collectioncoversync_'
@@ -143,7 +143,11 @@ class CollectionCoverSync(_PluginBase):
             {'component':'VAlert','props':{'type':'warning','variant':'tonal',
              'text':'缺少 TMDB 合集编号时跳过并记录，请先在 Emby 元数据中填写编号。不会猜测匹配、修改影片元数据或触发全库重新刮削。'}}
         ]
-        return [{'component': 'VForm', 'content': content}], dict(self.DEFAULTS)
+        # Give each control its own grid cell; host themes may hide field details.
+        rows = [{'component': 'VCol', 'props': {'cols': 12, 'class': 'py-3'},
+                 'content': [control]} for control in content]
+        return [{'component': 'VForm', 'content': [
+            {'component': 'VRow', 'content': rows}]}], dict(self.DEFAULTS)
 
     def get_page(self):
         history = self.get_data('history') or []
