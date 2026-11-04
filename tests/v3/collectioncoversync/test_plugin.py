@@ -48,6 +48,7 @@ class FakeEmby:
     def __init__(self,data=None,items=None):
         self.data=data;self.items=items or [item()];self.uploads=[];self.calls=0;self.before_second=None
     def collections(self,parent,stop):return iter(self.items)
+    def image_info(self,ident):return [{'ImageType':'Primary'}]
     def image(self,ident):
         self.calls+=1
         if self.calls==2 and self.before_second:self.before_second()
@@ -66,6 +67,44 @@ class EngineTests(unittest.TestCase):
     def setUp(self):self.temp=tempfile.TemporaryDirectory();self.src=Source()
     def tearDown(self):self.temp.cleanup()
     def run_engine(self,emby,**kw):return c.SyncEngine(emby,self.src,self.temp.name).run(pause=0,**kw)
+    def test_missing_record_with_500_image_is_repaired(self):
+        class Missing(FakeEmby):
+            def image_info(self, ident):
+                return [{'ImageType':'Primary'}] if self.uploads else []
+        e=Missing(c.HttpError(500))
+        r=self.run_engine(e)
+        self.assertEqual(r['counts'], {'synced':1})
+        self.assertEqual(len(e.uploads),1)
+
+    def test_real_image_info_endpoint(self):
+        e=c.Emby('http://emby','test')
+        e.call=Mock(return_value=b'[]')
+        self.assertEqual(e.image_info('97623'),[])
+        e.call.assert_called_once_with('/Items/97623/Images')
+
+    def test_metadata_failure_does_not_overwrite(self):
+        class Offline(FakeEmby):
+            def image_info(self, ident): raise c.HttpError(500)
+        e=Offline()
+        self.assertEqual(self.run_engine(e)['counts'], {'error':1})
+        self.assertFalse(e.uploads)
+        self.assertEqual(self.src.calls,0)
+
+    def test_chinese_progress_and_verified_success(self):
+        logs=[]
+        r=c.SyncEngine(FakeEmby(),self.src,self.temp.name,log=logs.append).run(pause=0)
+        self.assertTrue(any('发现缺少封面' in x for x in logs))
+        self.assertTrue(any('导入封面完成' in x for x in logs))
+        self.assertIn('成功补图/恢复 1 个',r['summary'])
+    def test_verification_failure_not_logged_as_success(self):
+        class BrokenReadback(FakeEmby):
+            def upload(self,ident,data): self.data=c.HttpError(500)
+        logs=[]
+        r=c.SyncEngine(BrokenReadback(),self.src,self.temp.name,log=logs.append).run(pause=0)
+        self.assertEqual(r['counts'],{'error':1})
+        self.assertIn('导入后验证封面失败',r['items'][0]['error'])
+        self.assertFalse(any('成功：导入封面完成' in x for x in logs))
+        self.assertIn('存在失败项',r['summary'])
     def test_valid_manual_image_preserved_even_without_tag(self):
         e=FakeEmby(photo());r=self.run_engine(e)
         self.assertEqual(r['counts'],{'healthy':1});self.assertFalse(e.uploads);self.assertEqual(self.src.calls,0)
