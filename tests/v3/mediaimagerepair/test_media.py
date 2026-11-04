@@ -100,4 +100,33 @@ class Tests(unittest.TestCase):
     def test_invalid_type_disables_plugin(self):
         p=plugin.MediaImageRepair();p.init_plugin({'enabled':True,'emby_url':'http://emby','emby_key':'test','types':['BoxSet']});self.assertFalse(p.get_state())
 
+class LogTests(unittest.TestCase):
+    setUp=Tests.setUp
+    tearDown=Tests.tearDown
+    run_engine=Tests.run_engine
+    def test_verified_chinese_success(self):
+        logs=[]
+        result=c.MediaEngine(Fake(),self.tmp.name,http=self.http,log=logs.append).run(pause=0)
+        self.assertTrue(any('搜索成功' in line for line in logs))
+        self.assertTrue(any('重新读取验证成功' in line for line in logs))
+        self.assertIn('补图成功 1 项',result['summary'])
+
+    def test_failed_download_reason(self):
+        self.http.get.side_effect=c.HttpError(429)
+        result=self.run_engine(Fake())
+        self.assertIn('下载 TMDB 图片失败',result['items'][0]['message'])
+        self.assertIn('请求过于频繁',result['items'][0]['message'])
+        self.assertIn('部分失败',result['summary'])
+
+    def test_page_displays_failure_and_local_time(self):
+        p=plugin.MediaImageRepair()
+        p.store['history']=[dict(finished='2026-11-04T15:00:00+00:00',counts={'error':1},items=[dict(name='测试电影',status='error',error='网络失败')])]
+        page=p.get_page()[0]
+        self.assertIn('96px',page['props']['style'])
+        content=page['content']
+        self.assertEqual(content[0]['props']['type'],'warning')
+        self.assertIn('23:00:00',content[0]['props']['text'])
+        self.assertEqual(content[1]['props']['text'],'网络失败')
+
 if __name__=='__main__':unittest.main()
+
