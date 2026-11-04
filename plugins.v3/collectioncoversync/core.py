@@ -27,7 +27,7 @@ class SyncError(Exception):
 class HttpError(SyncError):
     def __init__(self, status):
         self.status = status
-        super().__init__(f'HTTP {status}')
+        super().__init__({401: '认证失败（HTTP 401），请检查 API Key', 403: '访问被拒绝（HTTP 403），请检查权限或网络限制', 404: '资源不存在（HTTP 404），请核对编号或服务地址', 429: '请求过于频繁（HTTP 429），请稍后重试'}.get(status, f'服务返回异常（HTTP {status}）'))
 
 
 class SameOriginRedirect(request.HTTPRedirectHandler):
@@ -181,6 +181,12 @@ class Emby:
             if offset >= page.get('TotalRecordCount', float('inf')):
                 return
 
+    def image_info(self, item_id):
+        result = json.loads(self.call('/Items/' + parse.quote(str(item_id), safe='') + '/Images'))
+        if not isinstance(result, list):
+            raise SyncError('Emby 图片记录格式异常，未修改封面')
+        return result
+
     def image(self, item_id):
         return self.call('/Items/' + parse.quote(str(item_id), safe='') + '/Images/Primary')
 
@@ -194,7 +200,8 @@ class TMDB:
         self.language = language
         self.http = http or HTTP(proxy=proxy or None)
 
-    def poster(self, collection_id):
+    def poster(self, collection_id, progress=None):
+        progress = progress or (lambda message: None)
         cid = numeric(collection_id)
         if not cid:
             raise SyncError('缺少有效的 TMDB 合集编号')
@@ -219,11 +226,13 @@ class TMDB:
             if not parser.poster:
                 raise SyncError('TMDB 合集尚无封面或页面结构变化')
             src = poster_url(parser.poster)
+        progress('搜索成功，已找到封面；正在下载图片')
         return jpeg(self.http.get(src, public=True)), {'page': page_url, 'image': src, 'tmdb': cid}
 
 
 class SyncEngine:
-    def __init__(self, emby, source, data_dir, stop=None):
+    def __init__(self, emby, source, data_dir, stop=None, log=None):
+        self.log = log or (lambda message: None)
         self.emby, self.source = emby, source
         # Isolate caches between media servers (including instances using the same directory in tests).
         scope = hashlib.sha256(emby.base.encode()).hexdigest()[:16]
@@ -260,6 +269,9 @@ class SyncEngine:
             return None
 
     def _state(self, item):
+        info = self.emby.image_info(item['Id'])
+        if not any(x.get('ImageType') == 'Primary' for x in info):
+            return 'missing', None
         try:
             data = self.emby.image(item['Id'])
         except HttpError as exc:
@@ -273,18 +285,26 @@ class SyncEngine:
             return 'corrupt', data
 
     def run(self, parent='', repair=True, dry_run=False, pause=1.0):
+        self.log('开始检查合集封面' + ('（仅检查模式，不导入图片）' if dry_run else ''))
         report = {'started': datetime.now(timezone.utc).isoformat(), 'dry_run': dry_run, 'items': []}
         try:
             for item in self.emby.collections(parent, self.stop):
                 if self.stop.is_set():
                     break
                 row = {'id': item['Id'], 'name': item.get('Name', ''), 'status': 'skipped'}
+                stage = '检查现有封面'
+                name = str(item.get('Name') or item['Id']).replace('\n', ' ').replace('\r', ' ')
+                def progress(message):
+                    self.log(f'【{name}】{message}')
+                progress(stage)
                 try:
                     cid = numeric(item.get('ProviderIds', {}).get('Tmdb'))
                     if item.get('IsLocked') or 'Images' in item.get('LockedFields', []):
                         row['status'] = 'locked'
                     else:
                         state, old = self._state(item)
+                        if state != 'healthy':
+                            progress('发现缺少封面' if state == 'missing' else '发现封面损坏，无法解码')
                         if state == 'healthy':
                             row['status'] = 'healthy'
                             # Back up existing manual posters as well, never replace them with TMDB artwork.
@@ -297,9 +317,22 @@ class SyncEngine:
                             row['status'] = 'would_repair' if state == 'corrupt' else 'would_fill'
                         else:
                             cached = self._cached(item, cid)
-                            data, meta = cached if cached else self.source.poster(cid)
+                            stage = '从备份读取封面' if cached else '查询 TMDB 并下载封面'
+                            progress('找到本地备份，准备恢复' if cached else f'正在查询 TMDB 合集编号 {cid}')
+                            def source_progress(message):
+                                nonlocal stage
+                                stage = '下载 TMDB 封面'
+                                progress(message)
+                            if cached:
+                                data, meta = cached
+                            elif isinstance(self.source, TMDB):
+                                data, meta = self.source.poster(cid, progress=source_progress)
+                            else:
+                                data, meta = self.source.poster(cid)
+                            progress('封面已读取，正在校验图片')
                             validate_image(data)
                             # Recheck directly before mutation: user may have added a poster during download.
+                            stage = '导入前复查 Emby 封面'
                             fresh, latest = self._state(item)
                             if fresh == 'healthy':
                                 row['status'] = 'healthy'
@@ -313,15 +346,30 @@ class SyncEngine:
                                     digest = hashlib.sha256(old).hexdigest()
                                     (backup / (digest + '.bin')).write_bytes(old)
                                 # Cache before uploading so a timeout can be recovered next time.
+                                stage = '保存本地封面备份'
                                 self._cache(item, data, meta)
+                                stage = '导入封面到 Emby'
+                                progress('正在导入封面到 Emby')
                                 self.emby.upload(item['Id'], jpeg(data))
+                                stage = '导入后验证封面'
+                                progress('上传请求完成，正在验证 Emby 图片能否正常读取')
                                 validate_image(self.emby.image(item['Id']))
                                 row['status'] = 'restored' if cached else 'synced'
                                 row['source'] = meta.get('page', meta.get('source', 'cache'))
                 except SyncError as exc:
-                    row.update(status='error', error=str(exc))
+                    row.update(status='error', error=f'{stage}失败：{exc}')
                 except Exception:
-                    row.update(status='error', error='处理失败，请检查服务返回格式；未记录认证信息')
+                    row.update(status='error', error=f'{stage}失败：本地读写或服务返回格式异常；请检查数据目录权限及服务日志')
+                messages = {
+                    'healthy': '封面正常，保留现有图片', 'locked': '跳过：合集图片或元数据已锁定',
+                    'missing_tmdb': '跳过：缺少有效 TMDB 合集编号，请在 Emby 元数据中填写；本插件不按名称猜测匹配',
+                    'corrupt_skipped': '跳过：封面损坏，但未开启损坏图片修复',
+                    'would_repair': '检查完成：需要修复，当前仅检查模式，未导入',
+                    'would_fill': '检查完成：需要补图，当前仅检查模式，未导入',
+                    'restored': '成功：已从备份恢复封面，并验证可正常读取',
+                    'synced': '成功：导入封面完成，并验证可正常读取', 'cancelled': '已取消：未导入封面'}
+                row['message'] = row.get('error') or messages.get(row['status'], row['status'])
+                progress(row['message'])
                 report['items'].append(row)
                 if self.stop.wait(pause):
                     break
@@ -332,4 +380,14 @@ class SyncEngine:
         report['cancelled'] = self.stop.is_set()
         report['finished'] = datetime.now(timezone.utc).isoformat()
         report['counts'] = {s: sum(i['status'] == s for i in report['items']) for s in sorted({i['status'] for i in report['items']})}
+        counts = report['counts']
+        success = counts.get('synced', 0) + counts.get('restored', 0)
+        failed = counts.get('error', 0)
+        healthy = counts.get('healthy', 0)
+        skipped = len(report['items']) - success - failed - healthy
+        outcome = '任务已取消' if report['cancelled'] else ('任务未完整完成' if report.get('error') else ('检查结束，存在失败项' if failed else '检查完成'))
+        report['summary'] = f'{outcome}：检查 {len(report["items"])} 个合集，成功补图/恢复 {success} 个，封面正常 {healthy} 个，跳过/待处理 {skipped} 个，失败 {failed} 个。'
+        if report.get('error'):
+            report['summary'] += '读取合集列表失败：' + report['error']
+        self.log(report['summary'])
         return report

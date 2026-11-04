@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import threading
 from copy import deepcopy
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from apscheduler.triggers.cron import CronTrigger
 from app.sdk.plugin import _PluginBase
@@ -17,7 +19,7 @@ class CollectionCoverSync(_PluginBase):
     plugin_name = '合集封面同步'
     plugin_desc = '定期检查 Emby 合集封面，从 TMDB 补齐缺图，修复无效图片并保留手工封面。'
     plugin_icon = 'Emby_A.png'
-    plugin_version = '1.0.1'
+    plugin_version = '1.0.2'
     plugin_author = 'Windz'
     author_url = ''
     plugin_config_prefix = 'collectioncoversync_'
@@ -93,7 +95,7 @@ class CollectionCoverSync(_PluginBase):
         try:
             engine = SyncEngine(Emby(config['emby_url'], config['emby_key']),
                                 TMDB(config['tmdb_key'], config['proxy'], config['language']),
-                                self.get_data_path(), stop)
+                                self.get_data_path(), stop, log=lambda message: logger.info('合集封面同步：' + message))
             result = engine.run(parent=config['parent_id'].strip(), repair=config['repair'],
                                 dry_run=config['dry_run'])
             # Keep reports bounded. Do not persist endpoint credentials or raw exception strings.
@@ -102,7 +104,7 @@ class CollectionCoverSync(_PluginBase):
                 history = []
             history.append(result)
             self.save_data('history', history[-20:])
-            logger.info('合集封面同步完成：' + str(result['counts']))
+            # The engine emits a Chinese summary including partial failures.
             if result.get('error'):
                 logger.warning('合集封面同步：' + result['error'])
             return result
@@ -128,23 +130,23 @@ class CollectionCoverSync(_PluginBase):
             {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal',
              'text': '仅管理 Emby 合集主海报。有效封面（包括手工封面）不覆盖；网络错误不视为缺图。默认每 6 小时检查。'}},
             field('VSwitch', 'enabled', '启用定期检查'),
-            field('VSwitch', 'onlyonce', '保存后立即运行一次'),
-            field('VSwitch', 'dry_run', '仅检查，不上传图片'),
-            field('VSwitch', 'repair', '修复无法解码的损坏图片'),
-            field('VTextField', 'emby_url', 'Emby 服务地址', placeholder='http://192.168.1.10:8096'),
-            field('VTextField', 'emby_key', 'Emby API Key', type='password', autocomplete='off'),
+            field('VSwitch', 'onlyonce', '保存后检查一次（执行后自动关闭）'),
+            field('VSwitch', 'dry_run', '只检查问题，不补图（关闭后才会修复）'),
+            field('VSwitch', 'repair', '同时修复损坏图片（缺图始终会检查）'),
+            field('VTextField', 'emby_url', 'Emby 服务地址', placeholder='http://192.168.1.10:8096', hint='优先填写 NAS 内网地址；不要填写 /web 网页地址。', persistent_hint=True),
+            field('VTextField', 'emby_key', 'Emby API 密钥', type='password', autocomplete='off', hint='在 Emby 后台 → 高级 → API 密钥中获取。', persistent_hint=True),
             field('VTextField', 'parent_id', '限定合集父目录 ID（留空检查全部合集）'),
-            field('VTextField', 'cron', '检查周期（Cron）', hint='默认 17 */6 * * *；使用 MoviePilot 时区', persistent_hint=True),
+            field('VTextField', 'cron', '检查周期（Cron）', hint='默认每天 00:17、06:17、12:17、18:17；按 MoviePilot 时区执行。Cron 格式：分 时 日 月 周。', persistent_hint=True),
             field('VTextField', 'tmdb_key', 'TMDB API Key / Read Access Token（可选）', type='password',
                   hint='留空读取 TMDB 公共合集页面；填写后优先使用官方 API', persistent_hint=True),
-            field('VTextField', 'proxy', 'TMDB 专用 HTTP 代理（可选）', placeholder='http://192.168.1.2:7890'),
+            field('VTextField', 'proxy', 'TMDB 图片下载代理（可选）', placeholder='http://192.168.1.2:7890', hint='留空直接连接；此设置不代理 Emby 请求。', persistent_hint=True),
             field('VSelect', 'language', '海报语言', items=[{'title':'简体中文','value':'zh-CN'},
                 {'title':'繁体中文','value':'zh-TW'}, {'title':'English','value':'en-US'}]),
             {'component':'VAlert','props':{'type':'warning','variant':'tonal',
              'text':'缺少 TMDB 合集编号时跳过并记录，请先在 Emby 元数据中填写编号。不会猜测匹配、修改影片元数据或触发全库重新刮削。'}}
         ]
         # Give each control its own grid cell; host themes may hide field details.
-        rows = [{'component': 'VCol', 'props': {'cols': 12, 'class': 'py-3'},
+        rows = [{'component': 'VCol', 'props': {'cols': 12, 'class': 'py-3', 'style': 'padding-top: 14px; padding-bottom: 14px;'},
                  'content': [control]} for control in content]
         return [{'component': 'VForm', 'content': [
             {'component': 'VRow', 'content': rows}]}], dict(self.DEFAULTS)
@@ -159,12 +161,32 @@ class CollectionCoverSync(_PluginBase):
         labels = {'healthy':'正常／保留','locked':'元数据已锁定','missing_tmdb':'缺少 TMDB 编号',
                   'corrupt_skipped':'损坏／未启用修复','would_repair':'待修复','would_fill':'待补图',
                   'restored':'从备份恢复','synced':'从 TMDB 同步','cancelled':'已取消','error':'错误'}
-        rows = [dict(x, status=labels.get(x['status'],x['status'])) for x in last['items']]
-        summary = '；'.join(f'{labels.get(k,k)} {v}' for k,v in last['counts'].items()) or '未检查到合集'
-        return [
-            {'component':'VAlert','props':{'type':'error' if last.get('error') else 'info',
-             'text':f"最近检查（UTC）：{last['finished']}。{summary}。{last.get('error','')}"}},
-            {'component':'VDataTable','props':{'headers':[{'title':'合集','key':'name'},
-              {'title':'状态','key':'status'},{'title':'说明','key':'error'}], 'items':rows, 'itemsPerPage':25}},
-            {'component':'VAlert','props':{'type':'info','text':'正常封面会备份到插件数据目录；缺失时优先恢复原图。保留最近 20 次检查记录。'}}
-        ]
+        counts = last.get('counts', {})
+        summary = last.get('summary') or '；'.join(f'{labels.get(k,k)} {v} 项' for k,v in counts.items()) or '未检查到条目'
+        if not last.get('summary') and counts.get('error'):
+            summary = '检查结束，部分失败：' + summary
+        try:
+            moment = datetime.fromisoformat(last['finished']).astimezone(ZoneInfo(str(settings.TZ)))
+            when = moment.strftime('%Y-%m-%d %H:%M:%S') + '（' + str(settings.TZ) + '）'
+        except (ValueError, KeyError, TypeError):
+            when = str(last.get('finished', '时间未知'))
+        severity = 'error' if last.get('error') else ('warning' if counts.get('error') else 'info')
+        content = [{'component':'VAlert', 'props':{'type':severity, 'variant':'tonal',
+                    'text':f"最近检查：{when}。{summary} {last.get('error', '')}", 'class':'mb-4'}}]
+        # Explicit cards avoid the host's data-table slot rendering dependency.
+        # Errors first, with every item still visible and no English pagination.
+        rows = sorted(last.get('items', []), key=lambda x: x.get('status') != 'error')
+        for row in rows:
+            status = labels.get(row.get('status'), '未识别状态')
+            detail = row.get('message') or row.get('error') or status
+            content.append({'component':'VCard', 'props':{
+                'variant':'outlined', 'class':'mb-3',
+                'title':str(row.get('name') or row.get('id', '未命名条目')),
+                'subtitle':status, 'text':detail,
+                'style':'white-space: normal; overflow-wrap: anywhere;'}})
+        if not rows:
+            content.append({'component':'VAlert','props':{'variant':'tonal','type':'info','text':'本次没有条目明细，请查看上方错误或检查范围。'}})
+        content.append({'component':'VAlert','props':{'variant':'tonal','type':'info',
+                        'text':'保留最近 20 次检查记录；修复前优先使用有效备份。缺少来源或网络失败的条目会明确记录原因。'}})
+        return [{'component':'VContainer','props':{'fluid':True,
+                 'style':'padding: 16px 16px 96px;'},'content':content}]
