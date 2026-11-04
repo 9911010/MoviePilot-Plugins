@@ -27,7 +27,7 @@ class SyncError(Exception):
 class HttpError(SyncError):
     def __init__(self, status):
         self.status = status
-        super().__init__(f'HTTP {status}')
+        super().__init__({401: '认证失败（HTTP 401），请检查 API Key', 403: '访问被拒绝（HTTP 403），请检查权限或网络限制', 404: '资源不存在（HTTP 404），请核对编号或服务地址', 429: '请求过于频繁（HTTP 429），请稍后重试'}.get(status, f'服务返回异常（HTTP {status}）'))
 
 
 class SameOriginRedirect(request.HTTPRedirectHandler):

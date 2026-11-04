@@ -57,9 +57,10 @@ class MediaEmby(Emby):
 
 
 class MediaEngine:
-    def __init__(self, emby, data_dir, stop=None, http=None):
+    def __init__(self, emby, data_dir, stop=None, http=None, log=None):
         self.emby, self.stop = emby, stop or threading.Event()
         self.http = http or HTTP()
+        self.log = log or (lambda message: None)
         self.folder = Path(data_dir) / hashlib.sha256(emby.base.encode()).hexdigest()[:16]
         self.folder.mkdir(parents=True, exist_ok=True)
 
@@ -92,6 +93,7 @@ class MediaEngine:
             return row
         if item.get('IsLocked') or 'Images' in (item.get('LockedFields') or []):
             return dict(row, status='locked')
+        self._stage = '检查现有图片'
         state, old = self.state(item)
         cache = self.path(item)
         if state == 'healthy':
@@ -102,6 +104,8 @@ class MediaEngine:
             return dict(row, status='corrupt_skipped')
         if dry_run:
             return dict(row, status='would_repair' if state == 'corrupt' else 'would_fill')
+        self.log('发现图片缺失' if state == 'missing' else '发现图片损坏')
+        self._stage = '读取图片备份'
         data = None
         if cache.exists():
             try:
@@ -112,11 +116,16 @@ class MediaEngine:
         restored = data is not None
         source = 'backup'
         if data is None:
+            self._stage = '查询 TMDB 图片候选'
+            self.log('正在通过 Emby 查询已匹配条目的 TMDB 图片')
             candidates = self.emby.candidates(item['Id'])
             candidates.sort(key=lambda x: x.get('Language') not in (language, language.split('-')[0]))
             if not candidates:
                 return dict(row, status='no_source')
-            for candidate in candidates[:4]:
+            self.log(f'搜索成功，找到 {len(candidates)} 张候选图片；开始下载（最多尝试 4 张）')
+            self._stage = '下载 TMDB 图片'
+            failures = []
+            for index, candidate in enumerate(candidates[:4], 1):
                 if self.stop.is_set():
                     return dict(row, status='cancelled')
                 try:
@@ -124,10 +133,15 @@ class MediaEngine:
                     data = self.http.get(source, public=True)
                     validate_image(data, minimum=200)
                     break
-                except SyncError:
+                except SyncError as exc:
+                    failures.append(str(exc))
+                    self.log(f'第 {index} 张下载或校验失败：{exc}')
                     data = None
             if data is None:
-                raise SyncError('TMDB 候选图片下载失败；保留原图')
+                raise SyncError('候选图片均下载或校验失败：' + '；'.join(dict.fromkeys(failures)))
+        if restored:
+            self.log('找到有效备份，准备恢复原图')
+        self._stage = '导入前复查现有图片'
         fresh, current = self.state(item)
         if fresh == 'healthy':
             return dict(row, status='healthy')
@@ -139,7 +153,11 @@ class MediaEngine:
             atomic(damaged / (hashlib.sha256(current).hexdigest() + '.bin'), current)
         data = jpeg(data)
         atomic(cache, data)
+        self._stage = '导入图片到 Emby'
+        self.log('图片已准备好，正在导入 Emby')
         self.emby.upload(item['Id'], data)
+        self._stage = '验证导入结果'
+        self.log('导入请求已完成，正在重新读取图片验证')
         validate_image(self.emby.image(item['Id']))
         return dict(row, status='restored' if restored else 'synced', source=source)
 
@@ -156,18 +174,29 @@ class MediaEngine:
             offset = 0
         report = dict(started=datetime.now(timezone.utc).isoformat(), items=[], dry_run=dry_run,
                       offset=offset, next_offset=offset, total=0)
+        self.log(f'开始检查，从第 {offset + 1} 项继续；本批最多 {batch_size} 项' + ('（仅检查，不上传）' if dry_run else ''))
         try:
             items, total = self.emby.batch(types, parent, offset, int(batch_size))
             report['total'] = total
             for item in items:
                 if self.stop.is_set():
                     break
+                name = str(item.get('SeriesName', '') + ' ' + item.get('Name', '')).replace('\n', ' ').strip()
+                self.log(f'【{name}】开始检查')
+                self._stage = '检查条目'
                 try:
                     row = self.check(item, repair, dry_run, backup_healthy, language)
                 except SyncError as exc:
-                    row = dict(id=item['Id'], name=item.get('Name', ''), type=item.get('Type'), status='error', error=str(exc))
+                    row = dict(id=item['Id'], name=item.get('Name', ''), type=item.get('Type'), status='error', error=f'{self._stage}失败：{exc}')
                 except Exception:
                     row = dict(id=item['Id'], name=item.get('Name', ''), type=item.get('Type'), status='error', error='处理失败，未记录认证信息')
+                messages = {'healthy':'图片正常，保留现有图片', 'locked':'已锁定图片或元数据，跳过',
+                    'no_source':'Emby 未返回 TMDB 图片候选；请检查该条目的 TMDB 编号及图片提供器，不能据此判断片名错误',
+                    'corrupt_skipped':'图片损坏，但未启用损坏修复', 'would_repair':'发现损坏图片；仅检查模式未执行修复',
+                    'would_fill':'发现缺图；仅检查模式未下载或导入', 'restored':'从备份恢复完成，重新读取验证成功',
+                    'synced':'TMDB 图片导入完成，重新读取验证成功', 'cancelled':'任务已取消', 'skipped':'类型不在检查范围'}
+                row['message'] = row.get('error') or messages.get(row['status'], '未知状态')
+                self.log(f'【{name}】{row["message"]}')
                 report['items'].append(row)
                 if row['status'] == 'cancelled':
                     break
@@ -185,4 +214,9 @@ class MediaEngine:
             report['error'] = '无法读取媒体列表或保存检查位置'
         report.update(finished=datetime.now(timezone.utc).isoformat(), cancelled=self.stop.is_set(),
                       counts=dict(Counter(x['status'] for x in report['items'])))
+        counts = report['counts']
+        success = counts.get('synced', 0) + counts.get('restored', 0)
+        title = '任务已取消' if report['cancelled'] else ('任务失败' if report.get('error') else ('检查结束，部分失败' if counts.get('error') else '检查完成'))
+        report['summary'] = f'{title}：检查 {len(report["items"])} 项，补图成功 {success} 项，正常保留 {counts.get("healthy", 0)} 项，失败 {counts.get("error", 0)} 项，其余为跳过或仅检查。'
+        self.log(report['summary'] + report.get('error', ''))
         return report
