@@ -23,7 +23,7 @@ class MediaEmby(Emby):
         rows, total, seen = [], None, set()
         while len(rows) < limit:
             params = dict(IncludeItemTypes=','.join(types), Recursive='true',
-                          Fields='ProviderIds,Path,LockedFields,IsLocked,SeriesName',
+                          Fields='ProviderIds,Path,ParentId,LockedFields,IsLocked,SeriesName',
                           StartIndex=offset + len(rows), Limit=min(100, limit-len(rows)),
                           SortBy='SortName', SortOrder='Ascending')
             if parent:
@@ -43,6 +43,33 @@ class MediaEmby(Emby):
             if offset + len(rows) >= total:
                 break
         return rows, total or 0
+
+    def library_name(self, item):
+        # Virtual-folder paths are Emby's actual library configuration, not genres.
+        if not hasattr(self, '_libraries'):
+            folders = json.loads(self.call('/Library/VirtualFolders'))
+            if not isinstance(folders, list):
+                raise SyncError('Emby 媒体库列表格式异常')
+            self._libraries = folders
+            self._library_cache = {}
+        path = str(item.get('Path') or '').replace('\\', '/').rstrip('/')
+        matches = []
+        for folder in self._libraries:
+            for location in folder.get('Locations') or []:
+                root = str(location).replace('\\', '/').rstrip('/')
+                if root and (path == root or path.startswith(root + '/')):
+                    matches.append((len(root), folder.get('Name', '')))
+        if matches:
+            longest = max(length for length, name in matches)
+            return '、'.join(sorted({name for length, name in matches if length == longest and name}))
+        key = str(item.get('ParentId') or item['Id'])
+        if key not in self._library_cache:
+            ancestors = json.loads(self.call('/Items/' + quote(str(item['Id']), safe='') + '/Ancestors'))
+            if not isinstance(ancestors, list):
+                raise SyncError('Emby 上级目录格式异常')
+            self._library_cache[key] = next((x.get('Name', '') for x in ancestors
+                                            if x.get('Type') == 'CollectionFolder'), '')
+        return self._library_cache[key]
 
     def image_info(self, iid):
         result = json.loads(self.call('/Items/' + quote(str(iid), safe='') + '/Images'))
@@ -182,7 +209,15 @@ class MediaEngine:
                 if self.stop.is_set():
                     break
                 name = str(item.get('SeriesName', '') + ' ' + item.get('Name', '')).replace('\n', ' ').strip()
-                self.log(f'【{name}】开始检查')
+                started = datetime.now(timezone.utc).isoformat()
+                category = '电影' if item.get('Type') == 'Movie' else '剧集'
+                library, library_error = '', ''
+                try:
+                    library = self.emby.library_name(item)
+                except Exception:
+                    library_error = '媒体库分类读取失败'
+                label = f'{category} · {library or library_error or "未识别媒体库"}'
+                self.log(f'【{label}】【{name}】开始检查')
                 self._stage = '检查条目'
                 try:
                     row = self.check(item, repair, dry_run, backup_healthy, language)
@@ -195,8 +230,10 @@ class MediaEngine:
                     'corrupt_skipped':'图片损坏，但未启用损坏修复', 'would_repair':'发现损坏图片；仅检查模式未执行修复',
                     'would_fill':'发现缺图；仅检查模式未下载或导入', 'restored':'从备份恢复完成，重新读取验证成功',
                     'synced':'TMDB 图片导入完成，重新读取验证成功', 'cancelled':'任务已取消', 'skipped':'类型不在检查范围'}
+                row.update(name=name, category=category, library=library, library_error=library_error,
+                           started=started, finished=datetime.now(timezone.utc).isoformat())
                 row['message'] = row.get('error') or messages.get(row['status'], '未知状态')
-                self.log(f'【{name}】{row["message"]}')
+                self.log(f'【{label}】【{name}】{row["message"]}')
                 report['items'].append(row)
                 if row['status'] == 'cancelled':
                     break

@@ -19,7 +19,7 @@ class MediaImageRepair(_PluginBase):
     plugin_name = '影视图片修复'
     plugin_desc = '定期检查 Emby 影视图片，从 TMDB 补齐缺图，修复无效图片并保留手工封面。'
     plugin_icon = 'Emby_A.png'
-    plugin_version = '1.0.1'
+    plugin_version = '1.0.2'
     plugin_author = 'Windz'
     author_url = ''
     plugin_config_prefix = 'mediaimagerepair_'
@@ -184,11 +184,18 @@ class MediaImageRepair(_PluginBase):
         for row in rows:
             status = labels.get(row.get('status'), '未识别状态')
             detail = row.get('message') or row.get('error') or status
+            category = row.get('category') or ('电影' if row.get('type') == 'Movie' else '剧集')
+            library = row.get('library') or row.get('library_error') or '媒体库未记录'
+            try:
+                checked = datetime.fromisoformat(row['finished']).astimezone(ZoneInfo(str(settings.TZ))).strftime('%Y-%m-%d %H:%M:%S')
+                timing = f'执行完成时间：{checked}（{settings.TZ}）'
+            except (ValueError, KeyError, TypeError):
+                timing = '执行时间：旧记录未记录逐项时间，下次检查后显示'
             content.append({'component':'VCard', 'props':{
                 'variant':'outlined', 'class':'mb-3',
-                'title':str(row.get('name') or row.get('id', '未命名条目')),
-                'subtitle':status, 'text':detail,
-                'style':'white-space: normal; overflow-wrap: anywhere;'}})
+                'title':f'【{category} · {library}】' + str(row.get('name') or row.get('id', '未命名条目')),
+                'subtitle':status, 'text':detail + '\n' + timing,
+                'style':'white-space: pre-line; overflow-wrap: anywhere;'}})
         if not rows:
             content.append({'component':'VAlert','props':{'variant':'tonal','type':'info','text':'本次没有条目明细，请查看上方错误或检查范围。'}})
         content.append({'component':'VAlert','props':{'variant':'tonal','type':'info',
