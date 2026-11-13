@@ -191,6 +191,62 @@ class MediaEngine:
     def run(self, types=TYPES, parent='', batch_size=500, repair=True, dry_run=False,
             backup_healthy=False, language='zh-CN', pause=1):
         types = [t for t in TYPES if t in types]
+        budget = int(batch_size)
+        if not types or not 1 <= budget <= 2000:
+            raise SyncError('请选择媒体类型；每批数量应为 1 至 2000')
+        groups = [(name, [t for t in group if t in types]) for name, group in (
+            ('电影与整部剧海报', ('Movie', 'Series')), ('季与单集图片', ('Season', 'Episode')))]
+        groups = [(name, group) for name, group in groups if group]
+        # Independent cursors let posters cycle frequently without starving episodes.
+        turn_path = self.folder / ('turn-' + hashlib.sha256(
+            json.dumps([types, parent, dry_run]).encode()).hexdigest()[:16] + '.json')
+        if len(groups) == 2 and budget == 1:
+            try:
+                turn = int(json.loads(turn_path.read_text())['turn']) % 2
+            except (OSError, ValueError, KeyError, TypeError):
+                turn = 0
+            groups = [groups[turn]]
+        else:
+            turn = None
+        result = dict(started=datetime.now(timezone.utc).isoformat(), items=[], queues=[], dry_run=dry_run)
+        self.log(f'开始本批检查，最多 {budget} 项；电影与整部剧优先，季与单集独立续查。')
+        errors = []
+        for index, (name, group) in enumerate(groups):
+            if self.stop.is_set():
+                break
+            remaining = budget - len(result['items'])
+            limit = max(1, budget - max(1, budget // 5)) if len(groups) == 2 and index == 0 else remaining
+            report = self._run_queue(group, parent, limit, repair, dry_run, backup_healthy, language, pause)
+            result['items'].extend(report['items'])
+            progress = dict(name=name, checked=len(report['items']), total=report['total'],
+                            next_offset=report['next_offset'], completed=report.get('cycle_complete', False))
+            if report.get('error'):
+                progress['error'] = report['error']
+                errors.append(name + '：' + report['error'])
+            result['queues'].append(progress)
+            ending = '本轮已扫到末尾，下次从头复查' if progress['completed'] else f"下次从位置 {progress['next_offset']} 续查"
+            self.log(f"{name}：本批检查 {progress['checked']} 项，该队列共 {progress['total']} 项；{ending}。")
+        if turn is not None and result['queues'] and not self.stop.is_set():
+            atomic(turn_path, json.dumps({'turn': 1-turn}).encode())
+        result.update(finished=datetime.now(timezone.utc).isoformat(), cancelled=self.stop.is_set(),
+                      counts=dict(Counter(x['status'] for x in result['items'])))
+        if errors:
+            result['error'] = '；'.join(errors)
+        # Compatibility for consumers of old single-queue reports; UI uses queues.
+        result['total'] = sum(q['total'] for q in result['queues'])
+        result['next_offset'] = sum(q['next_offset'] for q in result['queues'])
+        counts = result['counts']
+        success = counts.get('synced', 0) + counts.get('restored', 0)
+        title = '本批已取消' if result['cancelled'] else ('本批部分失败' if errors or counts.get('error') else '本批检查结束')
+        skipped = sum(n for status, n in counts.items() if status not in ('synced', 'restored', 'healthy', 'error'))
+        result['summary'] = (f"{title}：检查 {len(result['items'])} 项，补图成功 {success} 项，正常保留 {counts.get('healthy', 0)} 项，"
+                             f"失败 {counts.get('error', 0)} 项，跳过或仅检查 {skipped} 项。本批结束不代表全库图片已补齐。")
+        self.log(result['summary'])
+        return result
+
+    def _run_queue(self, types=TYPES, parent='', batch_size=500, repair=True, dry_run=False,
+                   backup_healthy=False, language='zh-CN', pause=1):
+        types = [t for t in TYPES if t in types]
         if not types or not 1 <= int(batch_size) <= 2000:
             raise SyncError('请选择媒体类型；每批数量应为 1 至 2000')
         scope = hashlib.sha256(json.dumps([types, parent, dry_run]).encode()).hexdigest()[:16]
@@ -201,7 +257,7 @@ class MediaEngine:
             offset = 0
         report = dict(started=datetime.now(timezone.utc).isoformat(), items=[], dry_run=dry_run,
                       offset=offset, next_offset=offset, total=0)
-        self.log(f'开始检查，从第 {offset + 1} 项继续；本批最多 {batch_size} 项' + ('（仅检查，不上传）' if dry_run else ''))
+        self.log(f'队列开始检查，从第 {offset + 1} 项继续；本批最多 {batch_size} 项' + ('（仅检查，不上传）' if dry_run else ''))
         try:
             items, total = self.emby.batch(types, parent, offset, int(batch_size))
             report['total'] = total
@@ -241,7 +297,8 @@ class MediaEngine:
                 atomic(cursor, json.dumps({'offset': offset}).encode())
                 if self.stop.wait(pause):
                     break
-            if offset >= total:
+            if offset >= total and not self.stop.is_set():
+                report['cycle_complete'] = True
                 offset = 0
                 atomic(cursor, json.dumps({'offset': 0}).encode())
             report['next_offset'] = offset
@@ -255,5 +312,4 @@ class MediaEngine:
         success = counts.get('synced', 0) + counts.get('restored', 0)
         title = '任务已取消' if report['cancelled'] else ('任务失败' if report.get('error') else ('检查结束，部分失败' if counts.get('error') else '检查完成'))
         report['summary'] = f'{title}：检查 {len(report["items"])} 项，补图成功 {success} 项，正常保留 {counts.get("healthy", 0)} 项，失败 {counts.get("error", 0)} 项，其余为跳过或仅检查。'
-        self.log(report['summary'] + report.get('error', ''))
         return report

@@ -19,7 +19,7 @@ class MediaImageRepair(_PluginBase):
     plugin_name = '影视图片修复'
     plugin_desc = '定期检查 Emby 影视图片，从 TMDB 补齐缺图，修复无效图片并保留手工封面。'
     plugin_icon = 'Emby_A.png'
-    plugin_version = '1.0.2'
+    plugin_version = '1.0.3'
     plugin_author = 'Windz'
     author_url = ''
     plugin_config_prefix = 'mediaimagerepair_'
@@ -132,7 +132,7 @@ class MediaImageRepair(_PluginBase):
             return {'component': component, 'props': dict(model=model, label=label, **{k.replace('_', '-'): v for k, v in props.items()})}
         content = [
             {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal',
-             'text': '仅管理电影、电视剧、季和单集的主图片，不处理合集、背景图、Logo。每 6 小时检查一批，默认 500 项，检查位置自动接续。'}},
+             'text': '仅管理电影、电视剧、季和单集的主图片，不处理合集、背景图、Logo。每 6 小时检查一批，默认 500 项。优先检查电影和整部剧海报；季与单集使用独立进度，持续分批检查。'}},
             field('VSwitch', 'enabled', '启用定期检查'),
             field('VSwitch', 'onlyonce', '保存后检查一次（执行后自动关闭）'),
             field('VSwitch', 'dry_run', '只检查问题，不补图（关闭后才会修复）'),
@@ -141,9 +141,9 @@ class MediaImageRepair(_PluginBase):
             field('VTextField', 'emby_key', 'Emby API 密钥', type='password', autocomplete='off', hint='在 Emby 后台 → 高级 → API 密钥中获取。', persistent_hint=True),
             field('VTextField', 'parent_id', '限定媒体库 ID（留空检查全部媒体库）'),
             field('VSelect', 'types', '检查类型', multiple=True, chips=True, items=[{'title':n,'value':t} for n,t in zip(['电影','电视剧','季','单集'],TYPES)]),
-            field('VTextField', 'batch_size', '每次最多检查多少项（1–2000）', type='number', hint='默认 500；大媒体库分多次检查，降低 NAS 和网络负担。', persistent_hint=True),
+            field('VTextField', 'batch_size', '每次最多检查多少项（1–2000）', type='number', hint='默认 500：约 400 项用于电影和整部剧，剩余名额用于季与单集。两队列独立循环；只选一组类型时使用全部名额。设为 1 时两组轮流检查。', persistent_hint=True),
             field('VSwitch', 'backup_healthy', '备份正常图片（大型媒体库会占用较多磁盘）'),
-            field('VTextField', 'cron', '检查周期（Cron）', hint='默认每天 00:43、06:43、12:43、18:43；按 MoviePilot 时区执行。每批续查，整库完成后从头循环。', persistent_hint=True),
+            field('VTextField', 'cron', '检查周期（Cron）', hint='默认每天 00:43、06:43、12:43、18:43；按 MoviePilot 时区执行。两组分别续查、分别循环，单集不会挡住主海报的下一轮检查。', persistent_hint=True),
             field('VTextField', 'proxy', 'TMDB 图片下载代理（可选）', placeholder='http://192.168.1.2:7890', hint='留空直接连接；此设置不代理 Emby 请求。', persistent_hint=True),
             field('VSelect', 'language', '海报语言', items=[{'title':'简体中文','value':'zh-CN'},
                 {'title':'繁体中文','value':'zh-TW'}, {'title':'English','value':'en-US'}]),
@@ -198,8 +198,13 @@ class MediaImageRepair(_PluginBase):
                 'style':'white-space: pre-line; overflow-wrap: anywhere;'}})
         if not rows:
             content.append({'component':'VAlert','props':{'variant':'tonal','type':'info','text':'本次没有条目明细，请查看上方错误或检查范围。'}})
-        content.append({'component':'VAlert','props':{'variant':'tonal','type':'info',
-                        'text':f"下次从位置 {last.get('next_offset',0)} 继续；媒体总数 {last.get('total',0)}。正常图片备份需在设置中开启。"}})
+        for queue in last.get('queues', []):
+            ending = '本轮已扫到末尾，下次从头复查' if queue.get('completed') else f"下次从位置 {queue.get('next_offset',0)} 续查"
+            content.append({'component':'VAlert','props':{'variant':'tonal','type':'info',
+                'class':'mb-3', 'text':f"{queue['name']}：本批检查 {queue['checked']} 项，该队列共 {queue['total']} 项；{ending}。"}})
+        if not last.get('queues'):
+            content.append({'component':'VAlert','props':{'variant':'tonal','type':'info',
+                'text':f"旧版混合队列记录：下次位置 {last.get('next_offset',0)}，总数 {last.get('total',0)}。新版首次执行会建立两组独立进度。"}})
         content.append({'component':'VAlert','props':{'variant':'tonal','type':'info',
                         'text':'保留最近 20 次检查记录；修复前优先使用有效备份。缺少来源或网络失败的条目会明确记录原因。'}})
         return [{'component':'VContainer','props':{'fluid':True,
